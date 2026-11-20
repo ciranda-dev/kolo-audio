@@ -1,0 +1,344 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "17 5 * * 1"
+  workflow_dispatch:
+    inputs:
+      go-version:
+        description: Go version for the go-next job, for example a release candidate
+        default: stable
+
+permissions:
+  contents: read
+
+env:
+  CGO_ENABLED: "0"
+
+jobs:
+  workflow:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: every job has timeout-minutes
+        run: build/validate/check-timeouts.sh .github/workflows/ci.yml
+
+  cross:
+    name: vet and build (${{ matrix.goos }}/${{ matrix.goarch }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {goos: darwin, goarch: arm64}
+          - {goos: darwin, goarch: amd64}
+          - {goos: linux, goarch: arm64}
+          - {goos: linux, goarch: amd64}
+          - {goos: windows, goarch: arm64}
+          - {goos: windows, goarch: amd64}
+          - {goos: linux, goarch: "386"}
+          - {goos: linux, goarch: riscv64}
+          - {goos: freebsd, goarch: amd64}
+    env:
+      GOOS: ${{ matrix.goos }}
+      GOARCH: ${{ matrix.goarch }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: stable
+          cache: true
+          cache-dependency-path: go.mod
+
+      - name: gofmt
+        run: |
+          out=$(gofmt -l .)
+          if [ -n "$out" ]; then echo "$out"; exit 1; fi
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go build
+        run: go build ./...
+
+  test:
+    name: test (${{ matrix.os }}, go ${{ matrix.go }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {os: ubuntu-latest, go: "1.26"}
+          - {os: ubuntu-latest, go: stable}
+          - {os: ubuntu-24.04-arm, go: stable}
+          - {os: macos-latest, go: stable}
+          - {os: macos-15-intel, go: stable}
+          - {os: windows-latest, go: stable}
+          - {os: windows-11-arm, go: stable}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: ${{ matrix.go }}
+          cache: true
+          cache-dependency-path: go.mod
+
+      - name: go test
+        run: go test ./...
+
+      - name: go test -race
+        if: runner.os != 'Windows'
+        run: go test -race ./...
+        env:
+          CGO_ENABLED: "1"
+
+  test-32bit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: stable
+          cache: true
+          cache-dependency-path: go.mod
+
+      - name: go test (linux/386)
+        run: GOARCH=386 go test ./...
+
+  macos-no-compiler:
+    # A Mac with no usable C compiler must still build with CGO_ENABLED=0.
+    runs-on: macos-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: stable
+
+      - name: build with a failing cc first on PATH
+        run: |
+          shim=$(mktemp -d)
+          printf '#!/bin/sh\necho "cc: no compiler" >&2\nexit 1\n' >"$shim/cc"
+          chmod +x "$shim/cc"
+          PATH="$shim:$PATH" CGO_ENABLED=0 go build ./...
+          PATH="$shim:$PATH" CGO_ENABLED=0 go test -run 'CoreAudioEnumeration' ./
+
+  linux-no-compiler:
+    # A machine with no usable C compiler builds static binaries with CGO_ENABLED=0.
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: stable
+          cache: true
+          cache-dependency-path: go.mod
+
+      - name: build with failing cc and gcc first on PATH
+        run: |
+          shim=$(mktemp -d)
+          for c in cc gcc; do
+            printf '#!/bin/sh\necho "%s: no compiler" >&2\nexit 1\n' "$c" >"$shim/$c"
+            chmod +x "$shim/$c"
+          done
+          # cgo needs a compiler on Linux (Go's net package): the shim makes that visible.
+          # A fresh build cache, so that no cached cgo build hides the missing compiler.
+          if PATH="$shim:$PATH" CGO_ENABLED=1 GOCACHE="$RUNNER_TEMP/gocache-cgo" go build -o "$RUNNER_TEMP/cgo" ./examples/passthrough; then
+            echo "a cgo build worked with no compiler"
+            exit 1
+          fi
+          PATH="$shim:$PATH" CGO_ENABLED=0 go build ./...
+          PATH="$shim:$PATH" CGO_ENABLED=0 go build -o "$RUNNER_TEMP/passthrough" ./examples/passthrough
+          file "$RUNNER_TEMP/passthrough" | tee "$RUNNER_TEMP/file.txt"
+          grep -q 'statically linked' "$RUNNER_TEMP/file.txt"
+
+  go-next:
+    # The Go release that purego's no-cgo runtime support has to follow: scheduled with the newest
+    # stable Go, or run by hand with a release candidate.
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    name: go ${{ inputs.go-version || 'stable' }} (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: ${{ inputs.go-version || 'stable' }}
+          check-latest: true
+
+      - run: go vet ./...
+
+      - run: go test ./...
+
+  conformance:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: stable
+          cache: true
+          cache-dependency-path: go.mod
+
+      - name: RFC 8251 vectors, sha256 6b26a22f9ba87b2b836906a9bb7afec5f8e54d49553b1200382520ee6fedfa55
+        run: |
+          dir=$(build/validate/vectors.sh "$RUNNER_TEMP/vectors" | tail -n 1)
+          echo "KOLO_OPUS_VECTORS=$dir" >>"$GITHUB_ENV"
+
+      - name: conformance
+        run: |
+          go test -count=1 -v -run 'TestConformance' ./opus | tee conformance.log
+          grep -q 'vectors=24 range_mismatch=0 compare_fail=0' conformance.log
+
+      - name: translated codec against the vectors
+        run: go test -count=1 ./opus/internal/libopus
+
+  artifacts:
+    # The pinned toolchain is the arm64 wasi-sdk, so the rebuild runs on an arm64 host.
+    name: artifacts (rebuild and hash)
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: stable
+          cache: true
+          cache-dependency-path: build/tools/go.sum
+
+      - name: rebuild every wasm in a container and compare with SHA256SUMS
+        run: build/verify.sh --rebuild
+
+  regen:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: stable
+          cache: true
+          cache-dependency-path: build/tools/go.sum
+
+      - name: regenerate the Go from the committed wasm
+        run: build/regen.sh
+
+      - name: generated code is unchanged
+        run: git diff --exit-code
+
+  pulse:
+    name: pulse and pipewire in docker (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {runner: ubuntu-latest, arch: amd64}
+          - {runner: ubuntu-24.04-arm, arch: arm64}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: stable
+          cache: true
+          cache-dependency-path: go.mod
+
+      - name: pulse, alpine and pipewire servers with a null sink
+        run: build/validate/linux/run.sh ${{ matrix.arch }}
+
+  zero-install:
+    # Clean container: no C compiler, no pkg-config, no libopus, CC and CGO_ENABLED unset.
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: download modules
+        run: |
+          mkdir "$RUNNER_TEMP/modcache"
+          docker run --rm -v "$PWD:/src:ro" -v "$RUNNER_TEMP/modcache:/go/pkg/mod" -w /src \
+            golang:1.27-alpine go mod download
+
+      - name: build and test with no network
+        run: |
+          docker run --rm --network none -e GOPROXY=off \
+            -v "$PWD:/src:ro" -v "$RUNNER_TEMP/modcache:/go/pkg/mod:ro" -w /src golang:1.27-alpine sh -c '
+            set -eu
+            unset CC CGO_ENABLED
+            for tool in cc gcc g++ clang pkg-config pkgconf; do
+              if command -v "$tool"; then echo "$tool is installed"; exit 1; fi
+            done
+            test "$(go env CGO_ENABLED)" = 0
+            export GOCACHE=/tmp/gocache GOFLAGS=-mod=readonly
+            for t in darwin/arm64 darwin/amd64 linux/arm64 linux/amd64 windows/arm64 windows/amd64 linux/386; do
+              GOOS=${t%/*} GOARCH=${t#*/} go build -o /dev/null ./...
+              echo "built $t"
+            done
+            go build -o /tmp/passthrough ./examples/passthrough
+            go build -o /tmp/opustone ./examples/opustone
+            /tmp/opustone
+            /tmp/passthrough -list || true
+            go test -count=1 ./...
+          '
+
+  fuzz:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: stable
+          cache: true
+          cache-dependency-path: go.mod
+
+      - name: fuzz each target for 20s
+        run: |
+          pkgs=$(go list ./...)
+          n=0
+          for p in $pkgs; do
+            targets=$(go test -list '^Fuzz' "$p")
+            for f in $(printf '%s\n' "$targets" | grep '^Fuzz' || true); do
+              echo "== $p $f"
+              go test -run='^$' -fuzz="^${f}\$" -fuzztime=20s -fuzzminimizetime=5s "$p"
+              n=$((n+1))
+            done
+          done
+          if [ "$n" -eq 0 ]; then
+            echo "no fuzz targets found"
+            exit 1
+          fi
+
+      - name: upload failing inputs
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: fuzz-failures
+          path: '**/testdata/fuzz'
+          if-no-files-found: ignore

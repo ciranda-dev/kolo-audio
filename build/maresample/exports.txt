@@ -1,0 +1,8 @@
+kolo_rs_new
+kolo_rs_free
+kolo_rs_process
+kolo_rs_expected
+kolo_rs_input_latency
+kolo_rs_output_latency
+kolo_rs_reset
+kolo_malloc
